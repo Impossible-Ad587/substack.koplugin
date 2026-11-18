@@ -101,7 +101,7 @@ local function nonEmpty(v)
     return nil
 end
 
---- "The Cute Club", "amymatt" -> "The Cute Club (@amymatt)".
+--- Publication name + writer's username -> "Name (@username)".
 function M.whoLabel(name, handle)
     name, handle = nonEmpty(name), nonEmpty(handle)
     if handle then handle = handle:gsub("^@", "") end

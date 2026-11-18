@@ -120,7 +120,7 @@ local function slimPost(p)
     }
 end
 
---- "The Cute Club (@amymatt)": the publication's name plus its writer's handle,
+--- The publication's name plus its writer's Substack username in brackets,
 -- so it's clear who an article is from.
 local function pubLabel(pub)
     return SH.whoLabel(pub and pub.name, pub and pub.handle)
@@ -966,7 +966,7 @@ function Substack:cachePosts(host, posts, no_flush)
         pub.id = posts[1].publication_id
         changed = true
     end
-    -- Remember who writes it, for labels like "The Cute Club (@amymatt)".
+    -- Remember who writes it, so labels can show the writer's username.
     if pub and not pub.handle then
         local h = SH.mainHandle(posts)
         if h then pub.handle = h changed = true end

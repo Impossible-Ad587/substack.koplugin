@@ -1,0 +1,18 @@
+# Substack sign-in for the KOReader Substack plugin
+#
+# Lines starting with # are instructions. The plugin ignores them.
+#
+# 1. On a computer, sign in at substack.com in Chrome.
+# 2. Press Cmd+Option+I (Mac) or Ctrl+Shift+I (Windows) to open Developer Tools.
+# 3. Open the Application tab, then Storage > Cookies > https://substack.com
+# 4. Untick "Show URL-decoded" if it is ticked.
+# 5. Click the substack.sid row and copy its Value. It starts with s%3A
+# 6. Replace the placeholder line below with that value and save this file
+#    as plain text (in TextEdit: Format > Make Plain Text).
+# 7. Copy this file into the substack.koplugin folder on your e-reader.
+# 8. In KOReader: Substack > Account > Load session cookie from file.
+#    Say yes when it offers to delete this file afterwards.
+#
+# This value works like a password. Never share it or post it anywhere.
+
+PASTE_YOUR_SUBSTACK_SID_VALUE_HERE

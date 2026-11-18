@@ -93,8 +93,127 @@ function M.safeFilename(name, max_bytes)
 end
 
 ---------------------------------------------------------------------------
--- Text
+-- Writers (people) and their handles
 ---------------------------------------------------------------------------
+
+local function nonEmpty(v)
+    if type(v) == "string" and v ~= "" then return v end
+    return nil
+end
+
+--- "The Cute Club", "amymatt" -> "The Cute Club (@amymatt)".
+function M.whoLabel(name, handle)
+    name, handle = nonEmpty(name), nonEmpty(handle)
+    if handle then handle = handle:gsub("^@", "") end
+    if name and handle then return name .. " (@" .. handle .. ")" end
+    if handle then return "@" .. handle end
+    return name or "?"
+end
+
+--- Handle of a post's (first) author, from its bylines.
+function M.postHandle(post)
+    local bylines = type(post) == "table" and post.publishedBylines
+    if type(bylines) ~= "table" then return nil end
+    for _, b in ipairs(bylines) do
+        if type(b) == "table" and nonEmpty(b.handle) then return b.handle end
+    end
+    return nil
+end
+
+--- The handle that appears most often among these posts' authors (the
+-- publication's main writer; guest posts are outvoted).
+function M.mainHandle(posts)
+    local count, best, best_n = {}, nil, 0
+    for _, p in ipairs(posts or {}) do
+        local h = M.postHandle(p)
+        if h then
+            count[h] = (count[h] or 0) + 1
+            if count[h] > best_n then best, best_n = h, count[h] end
+        end
+    end
+    return best
+end
+
+local function findUser(list, uid)
+    if type(list) ~= "table" then return nil end
+    for _, u in ipairs(list) do
+        if type(u) == "table" and tonumber(u.id or u.user_id) == uid then return u end
+    end
+    return nil
+end
+
+--- Reads /api/v1/reader/feed/profile/{user_id}. Returns
+-- { person = { id, name, handle } | nil, posts = { { host, pub_name, pub_id, post } } }
+-- Only posts this person wrote are kept (not their restacks or likes), and
+-- Notes are skipped: they aren't articles.
+function M.parseProfileFeed(data, uid)
+    uid = tonumber(uid)
+    local items = {}
+    if type(data) == "table" then
+        items = type(data.items) == "table" and data.items or (type(data[1]) == "table" and data or {})
+    end
+    local person, posts, seen = nil, {}, {}
+    local function takePerson(u)
+        if not person and type(u) == "table" and (nonEmpty(u.name) or nonEmpty(u.handle)) then
+            person = { id = uid, name = nonEmpty(u.name), handle = nonEmpty(u.handle) }
+        end
+    end
+    for _, it in ipairs(items) do
+        if type(it) == "table" then
+            local ctx = type(it.context) == "table" and it.context or {}
+            takePerson(findUser(it.users, uid) or findUser(ctx.users, uid))
+            local post = type(it.post) == "table" and it.post or nil
+            if post and nonEmpty(post.slug) then
+                local mine
+                if type(post.publishedBylines) == "table" and post.publishedBylines[1] then
+                    local b = findUser(post.publishedBylines, uid)
+                    if b then mine = true takePerson(b) end
+                else
+                    local kind = tostring(ctx.type or it.type or ""):lower()
+                    mine = not (kind:find("restack") or kind:find("like") or kind:find("comment"))
+                end
+                local pub = type(it.publication) == "table" and it.publication
+                    or (type(post.publication) == "table" and post.publication) or nil
+                local host = M.hostForPublication(pub) or M.parsePostUrl(post.canonical_url)
+                local key = tostring(host) .. "|" .. post.slug
+                if mine and host and not seen[key] then
+                    seen[key] = true
+                    posts[#posts + 1] = {
+                        host = host, post = post,
+                        pub_name = pub and nonEmpty(pub.name) or nil,
+                        pub_id = pub and pub.id or post.publication_id,
+                    }
+                end
+            end
+        end
+    end
+    table.sort(posts, function(a, b) return (a.post.post_date or "") > (b.post.post_date or "") end)
+    return { person = person, posts = posts }
+end
+
+--- Reads /api/v1/user/{handle}/public_profile. Returns
+-- { id, name, handle, publications = { { host, name, id } } } with the
+-- person's own publications (primary first; ones they only contribute to are left out).
+function M.parsePublicProfile(data)
+    if type(data) ~= "table" then return nil end
+    local out = { id = tonumber(data.id), name = nonEmpty(data.name), handle = nonEmpty(data.handle), publications = {} }
+    local seen = {}
+    local function add(p)
+        local h = M.hostForPublication(p)
+        if h and not seen[h] then
+            seen[h] = true
+            out.publications[#out.publications + 1] = { host = h, name = nonEmpty(p.name) or M.displayName(h), id = p.id }
+        end
+    end
+    if type(data.primaryPublication) == "table" then add(data.primaryPublication) end
+    for _, pu in ipairs(type(data.publicationUsers) == "table" and data.publicationUsers or {}) do
+        if type(pu) == "table" and type(pu.publication) == "table" then
+            local role = tostring(pu.role or ""):lower()
+            if role == "" or role == "admin" or role == "owner" or pu.is_primary then add(pu.publication) end
+        end
+    end
+    return out
+end
 
 ---------------------------------------------------------------------------
 -- Post lists (JSON archive and RSS feed)
@@ -156,6 +275,13 @@ function M.parseFeed(xml)
         end
     end
     return posts
+end
+
+--- The publication's real name from its RSS feed (<channel><title>), or nil.
+function M.feedTitle(xml)
+    if type(xml) ~= "string" then return nil end
+    local head = xml:match("<channel>(.-)<item>") or xml:match("<channel>(.*)") or ""
+    return xmlText(head:match("<title>(.-)</title>"))
 end
 
 --- "how-authors-are-using-substack" -> "How authors are using substack"

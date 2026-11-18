@@ -24,7 +24,7 @@ do
 end
 
 local USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    .. "Chrome/124.0 Safari/537.36 KOReader-Substack/2.4"
+    .. "Chrome/124.0 Safari/537.36 KOReader-Substack/2.5"
 
 local Net = {}
 Net.__index = Net
@@ -55,7 +55,7 @@ function Net.friendly(err)
             or err:find("captcha") or err:find("challenge")
         local hint = looks_blocked
             and _("Substack's bot protection blocked this device for that request.")
-            or _("Substack didn't accept your session. Sign out, copy a fresh substack.sid, and load it again.")
+            or _("Substack didn't accept your session. Sign out, copy a fresh connect.sid (or substack.sid), and load it again.")
         return hint .. "\n\n" .. err
     end
     if code == 429 then return _("Substack is getting too many requests from this device. Wait a few minutes and try again.") end
@@ -79,17 +79,29 @@ function Net.new(settings)
     return setmetatable({ settings = settings }, Net)
 end
 
+--- Builds the Cookie header for a session value. Substack renamed its session
+-- cookie from substack.sid to connect.sid; accounts signed in recently only
+-- have connect.sid. Sending the value under both names works for either.
+function Net.sessionHeader(connect, legacy)
+    connect = connect or legacy
+    legacy = legacy or connect
+    if not connect then return nil end
+    return "connect.sid=" .. connect .. "; substack.sid=" .. legacy
+end
+
 --- Cleans a pasted cookie: drops newlines/quotes and a "Cookie:" prefix, and
--- keeps only the substack.sid pair if a whole cookie string was pasted.
+-- keeps only the session pair(s) (connect.sid / substack.sid) if a whole
+-- cookie string was pasted. Returns a ready-to-send Cookie header, or nil.
 function Net.cleanCookie(raw)
     if type(raw) ~= "string" then return nil end
     local c = raw:gsub("[\r\n\t]", ""):gsub('^"', ""):gsub('"$', "")
-    c = c:gsub("^[Cc]ookie:%s*", "")
-    local sid = c:match("substack%.sid=([^;%s]+)")
-    if sid then return "substack.sid=" .. sid end
+    c = c:gsub("^[Cc]ookie:%s*", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local connect = c:match("connect%.sid=([^;%s]+)")
+    local legacy = c:match("substack%.sid=([^;%s]+)")
+    if connect or legacy then return Net.sessionHeader(connect, legacy) end
     -- Some other cookie, or text that isn't a cookie value at all: don't send junk.
     if c == "" or c:find("[=;%s]") then return nil end
-    return "substack.sid=" .. c
+    return Net.sessionHeader(c, c)
 end
 
 --- Only substack.com hosts get the session cookie (never custom domains or CDNs).
@@ -160,9 +172,13 @@ function Net:get(url, file_path, send_cookie, tries)
     return nil, last_err
 end
 
+--- send_cookie: true = the saved session, a string = that exact Cookie header
+-- (used to test a new session before saving it), false/nil = none.
 function Net:_get(url, file_path, send_cookie)
     url = url:gsub("^%s+", ""):gsub("%s+$", "")
-    local cookie = send_cookie and self:cookie()
+    local cookie
+    if type(send_cookie) == "string" then cookie = send_cookie
+    elseif send_cookie then cookie = self:cookie() end
     local tried_without_cookie = false
     local first_error
     local hops = 0
@@ -234,8 +250,8 @@ function Net:_get(url, file_path, send_cookie)
     return nil, "too many redirects\n" .. url
 end
 
-function Net:getJson(url)
-    local body, err = self:get(url, nil, true)
+function Net:getJson(url, cookie)
+    local body, err = self:get(url, nil, cookie or true)
     if not body then return nil, err end
     local ok, data = pcall(json_decode, body)
     if not ok or type(data) ~= "table" then
@@ -253,8 +269,9 @@ function Net:post(url, body, cookie)
         ["Accept"] = "application/json",
         ["Content-Type"] = "application/json",
         ["Content-Length"] = tostring(#body),
+        ["Accept-Language"] = "en-US,en;q=0.9",
         ["Origin"] = "https://substack.com",
-        ["Referer"] = "https://substack.com/sign-in",
+        ["Referer"] = "https://substack.com/sign-in?redirect=%2F",
         ["Connection"] = "close",
     }
     if cookie and cookie ~= "" then headers["Cookie"] = cookie end
@@ -304,7 +321,35 @@ local function errorMessage(body, code)
         end
         if msg then return msg end
     end
+    -- Not JSON: usually Cloudflare's bot check answering instead of Substack.
+    local b = tostring(body or "")
+    if b:find("<html") or b:find("Just a moment") or b:find("Cloudflare") or b:find("challenge") then
+        return T(_("Substack's bot protection blocked the sign-in from this device (HTTP %1). Use Account → Load session cookie from file instead."), code)
+    end
     return T("HTTP %1", code)
+end
+
+local function sessionFromJar(jar)
+    if type(jar) ~= "table" then return nil end
+    return Net.sessionHeader(jar["connect.sid"], jar["substack.sid"])
+end
+Net.sessionFromJar = sessionFromJar
+
+--- Does Substack treat this Cookie header as signed in?
+-- Returns true, false (definitely not), or nil (couldn't tell, e.g. no network).
+function Net:checkSession(cookie)
+    local unsure = false
+    for _i, url in ipairs({
+        "https://substack.com/api/v1/user/profile/self",
+        "https://substack.com/api/v1/subscriptions?tvOnly=false",
+    }) do
+        local data, err = self:getJson(url, cookie)
+        if data and (data.id or data.handle or data.subscriptions or data.publications) then return true end
+        local code = tonumber(tostring(err or ""):match("HTTP (%d+)"))
+        if not (code == 401 or code == 403 or (data and true)) then unsure = true end
+    end
+    if unsure then return nil end
+    return false
 end
 
 --- Loads a page like a browser would (no redirects followed) and returns the
@@ -343,16 +388,35 @@ function Net:completeEmailCode(state, otp)
     local code, headers, body = self:post("https://substack.com/api/v1/email-otp-login/complete",
         payload, jarToHeader(state.jar))
     if type(code) ~= "number" then return nil, Net.friendly(code) end
-    local jar = Net.parseSetCookie(headers and (headers["set-cookie"] or headers["Set-Cookie"]))
-    local sid = jar["substack.sid"] or (state.jar and state.jar["substack.sid"])
-    -- Normally a fresh session cookie comes back. If Substack instead upgraded
-    -- the session from step 1 in place, that cookie is now the signed-in one.
-    if code >= 200 and code < 400 and sid then return sid end
-    logger.warn("Substack: email-otp-login failed", code, body)
-    if code >= 200 and code < 400 then
-        return nil, _("Substack accepted the code but didn't send a session. Try again, or use Paste session cookie.")
+    if code < 200 or code >= 400 then
+        logger.warn("Substack: email-otp-login failed", code, body)
+        return nil, errorMessage(body, code)
     end
-    return nil, errorMessage(body, code)
+    -- Substack now names its session cookie connect.sid (older accounts:
+    -- substack.sid). Version 2.4 only looked for substack.sid, so it either
+    -- found nothing or kept the signed-OUT cookie from step 1, which Substack
+    -- then rejected. Collect whichever comes back and test it before saving.
+    local fresh = Net.parseSetCookie(headers and (headers["set-cookie"] or headers["Set-Cookie"]))
+    local merged = {}
+    for k, v in pairs(state.jar or {}) do merged[k] = v end
+    for k, v in pairs(fresh) do merged[k] = v end
+    local candidates = {}
+    local from_reply, from_merged = sessionFromJar(fresh), sessionFromJar(merged)
+    if from_reply then candidates[#candidates + 1] = from_reply end
+    if from_merged and from_merged ~= from_reply then candidates[#candidates + 1] = from_merged end
+    if #candidates == 0 then
+        logger.warn("Substack: email-otp-login: no session cookie in reply", code)
+        return nil, _("Substack accepted the code but didn't send a session. Try again, or use Load session cookie from file.")
+    end
+    local unsure
+    for _i, cookie in ipairs(candidates) do
+        local ok = self:checkSession(cookie)
+        if ok then return cookie end
+        if ok == nil then unsure = unsure or cookie end
+    end
+    -- Couldn't check (network blip): keep the newest cookie; Check sign-in can confirm later.
+    if unsure then return unsure end
+    return nil, _("Substack accepted the code, but the session it sent back doesn't work. Request a new code and try again, or use Load session cookie from file.")
 end
 
 ---------------------------------------------------------------------------
@@ -477,7 +541,13 @@ end
 
 --- Checks that the saved session works. Returns true, or nil, err.
 function Net:verifySession()
-    local data, err = self:subscriptionsData()
+    local data, err = self:getJson("https://substack.com/api/v1/user/profile/self")
+    if data and (data.id or data.handle) then
+        self.self_id = tonumber(data.id)
+        return true
+    end
+    if tostring(err or ""):find("^HTTP 40[13]") then return nil, err end
+    data, err = self:subscriptionsData()
     if data then return true end
     return nil, err
 end
@@ -524,7 +594,8 @@ function Net:subscriptions()
         local h = SH.hostForPublication(p)
         if h and not seen[h] then
             seen[h] = true
-            found[#found + 1] = { host = h, name = str(p.name) or SH.displayName(h), id = p.id }
+            found[#found + 1] = { host = h, name = str(p.name) or SH.displayName(h), id = p.id,
+                                  author = str(p.author_name), handle = str(p.author_handle) }
         end
     end
     local data = self:subscriptionsData()
@@ -557,6 +628,84 @@ function Net:subscriptions()
         end
     end
     return found
+end
+
+---------------------------------------------------------------------------
+-- People you follow
+-- On Substack, *subscribing to a publication* and *following a person* are
+-- two different things. /subscriptions only lists publications; the people
+-- you follow come from /feed/following (a list of user ids).
+---------------------------------------------------------------------------
+
+--- Your own Substack user id (cached), or nil.
+function Net:selfId()
+    if self.self_id then return self.self_id end
+    local data = self:getJson("https://substack.com/api/v1/user/profile/self")
+    if type(data) == "table" and data.id then self.self_id = tonumber(data.id) end
+    return self.self_id
+end
+
+--- User ids of the people the signed-in account follows (yourself left out).
+function Net:followingIds()
+    local data, err = self:getJson("https://substack.com/api/v1/feed/following")
+    if not data then return nil, err end
+    local list = data
+    if type(data[1]) == "nil" then
+        list = data.ids or data.following or data.users or data.userIds or {}
+    end
+    local me = self:selfId()
+    local out, seen = {}, {}
+    for i, v in ipairs(list) do
+        local id = tonumber(type(v) == "table" and (v.id or v.user_id) or v)
+        -- Substack lists your own id first; skip it even if we couldn't look it up.
+        local is_me = (me and id == me) or (not me and i == 1)
+        if id and not is_me and not seen[id] then
+            seen[id] = true
+            out[#out + 1] = id
+        end
+    end
+    return out
+end
+
+--- A person's recent activity: { person = {id, name, handle}|nil, posts = {...} }.
+function Net:profileFeed(user_id)
+    local data, err = self:getJson(string.format("https://substack.com/api/v1/reader/feed/profile/%d", tonumber(user_id) or 0))
+    if not data then return nil, err end
+    return SH.parseProfileFeed(data, user_id)
+end
+
+--- Public profile by handle: { id, name, handle, publications = {...} }.
+function Net:publicProfile(handle)
+    local h = tostring(handle or ""):gsub("^@", ""):gsub("[^%w%-_%.]", "")
+    if h == "" then return nil, "no handle" end
+    local data, err = self:getJson("https://substack.com/api/v1/user/" .. h .. "/public_profile")
+    if not data then return nil, err end
+    return SH.parsePublicProfile(data)
+end
+
+--- Everything needed to follow one person. Returns
+-- { id, name, handle, publications = { {host, name, id} }, posts = {...} } or nil, err.
+function Net:person(user_id)
+    local feed, err = self:profileFeed(user_id)
+    if not feed then return nil, err end
+    local p = feed.person or {}
+    local out = { id = tonumber(user_id), name = p.name, handle = p.handle, publications = {}, posts = feed.posts }
+    if out.handle then
+        local prof = self:publicProfile(out.handle)
+        if prof then
+            out.name = out.name or prof.name
+            out.publications = prof.publications
+        end
+    end
+    if not out.name and not out.handle then return nil, "Unexpected response" end
+    return out
+end
+
+--- Real publication name from its RSS feed (for publications added by
+-- address, which otherwise only show their subdomain).
+function Net:publicationName(host)
+    local body = self:get(string.format("https://%s/feed", host), nil, false)
+    return body and SH.feedTitle(body) or nil
 end
 
 --- GET a list endpoint whose "limit" Substack validates against an
@@ -618,8 +767,7 @@ function Net:login(email, password)
     }, ",") .. "}"
     local code, headers, body = self:post("https://substack.com/api/v1/login", payload)
     if type(code) ~= "number" then return nil, Net.friendly(code) end
-    local set_cookie = headers and (headers["set-cookie"] or headers["Set-Cookie"]) or ""
-    local sid = set_cookie:match("substack%.sid=([^;,%s]+)")
+    local sid = sessionFromJar(Net.parseSetCookie(headers and (headers["set-cookie"] or headers["Set-Cookie"])))
     if code >= 200 and code < 400 and sid then return sid end
     local msg
     local ok, data = pcall(json_decode, body or "")

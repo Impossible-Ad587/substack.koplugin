@@ -283,10 +283,56 @@ local function sortKeyWords(e)
     return tonumber(e.meta.words) or math.huge
 end
 
+--- The writer an article belongs to, for grouping: their handle when known
+-- (so one person's posts stay together across publications), otherwise the
+-- publication.
+function Library:handleOf(a)
+    local handles = (self.prefs or {}).handles or {}
+    local h = a.handle or (a.host and handles[a.host]) or nil
+    if type(h) == "string" and h ~= "" then return (h:gsub("^@", "")) end
+    return nil
+end
+
+function Library:groupKey(a)
+    local h = self:handleOf(a)
+    if h then return "@" .. h:lower() end
+    return "pub:" .. tostring(a.publication or a.host or "?"):lower()
+end
+
+--- Writers in a list, each with counts and articles: { key, meta (their
+-- newest article), count, unread, reading, entries }, ordered by the name shown.
+function Library:groups(filter)
+    local by_key, out = {}, {}
+    for _, e in ipairs(self:list(filter)) do
+        local key = self:groupKey(e.meta)
+        local g = by_key[key]
+        if not g then
+            g = { key = key, meta = e.meta, handle = self:handleOf(e.meta), count = 0, unread = 0, reading = 0, entries = {} }
+            by_key[key] = g
+            out[#out + 1] = g
+        end
+        g.count = g.count + 1
+        g.entries[#g.entries + 1] = e -- in the list's own order (in progress first, then by sort)
+        if e.status == "unread" then g.unread = g.unread + 1 end
+        if e.status == "reading" then g.reading = g.reading + 1 end
+        if (e.meta.date or "") > (g.meta.date or "") then g.meta = e.meta end
+    end
+    table.sort(out, function(x, y)
+        -- Writers with something in progress first, then by name.
+        if (x.reading > 0) ~= (y.reading > 0) then return x.reading > 0 end
+        local nx = tostring(x.meta.publication or x.handle or ""):lower()
+        local ny = tostring(y.meta.publication or y.handle or ""):lower()
+        if nx ~= ny then return nx < ny end
+        return x.key < y.key
+    end)
+    return out
+end
+
 --- Entries with status info.
 -- filter: "inbox" | "short" | "archive" | "kept" | "all"
 -- ("short" = Inbox articles of known length up to prefs.short_words)
-function Library:list(filter)
+-- group (optional): only articles from this writer (a groupKey).
+function Library:list(filter, group)
     local prefs = self.prefs or {}
     local muted = prefs.muted or {}
     local short_words = prefs.short_words or 1150
@@ -303,6 +349,7 @@ function Library:list(filter)
                 local w = tonumber(a.words)
                 include = w ~= nil and w <= short_words
             end
+            if include and group then include = self:groupKey(a) == group end
             if include then
                 out[#out + 1] = { path = path, meta = a, status = status, percent = percent, highlights = hl }
             end

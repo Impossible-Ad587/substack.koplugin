@@ -28,7 +28,7 @@ local Library = require("substack_library")
 local Net = require("substack_net")
 local Export = require("substack_export")
 
-local VERSION = "2.4"
+local VERSION = "2.5"
 local PAGE_SIZE = 20
 -- Recent posts remembered per publication for offline browsing. Kept modest so
 -- the cache stays small even when following dozens of publications.
@@ -116,9 +116,19 @@ local function slimPost(p)
         post_date = str(p.post_date), audience = str(p.audience), type = str(p.type),
         wordcount = tonumber(p.wordcount), canonical_url = str(p.canonical_url),
         publication_id = p.publication_id, cover_image = str(p.cover_image),
-        publishedBylines = postAuthor(p) and { { name = postAuthor(p) } } or nil,
+        publishedBylines = postAuthor(p) and { { name = postAuthor(p), handle = SH.postHandle(p) } } or nil,
     }
 end
+
+--- "The Cute Club (@amymatt)": the publication's name plus its writer's handle,
+-- so it's clear who an article is from.
+local function pubLabel(pub)
+    return SH.whoLabel(pub and pub.name, pub and pub.handle)
+end
+
+--- How far back a sync looks for new posts, in days (0 = no limit).
+-- Older posts are never downloaded automatically, which saves space.
+local SYNC_DAYS_DEFAULT = 7
 
 -- Where to go back to when an article is closed. Module-level on purpose:
 -- KOReader runs separate plugin instances for the reader and the file
@@ -138,6 +148,9 @@ function Substack:init()
     self.settings = LuaSettings:open(dir .. "/substack.lua")
     self.cache = LuaSettings:open(dir .. "/substack_cache.lua")
     self.publications = self.settings:readSetting("publications") or {}
+    -- People you follow on Substack who have no publication of their own (or
+    -- whose publication couldn't be found): synced from their profile.
+    self.people = self.settings:readSetting("people") or {}
     self.net = Net.new(self.settings)
     self.library = Library.new{
         store = LuaSettings:open(dir .. "/substack_library.lua"),
@@ -178,6 +191,7 @@ end
 
 function Substack:saveSettings()
     self.settings:saveSetting("publications", self.publications)
+    self.settings:saveSetting("people", self.people)
     self.settings:flush()
 end
 
@@ -249,6 +263,37 @@ function Substack:pubByHost(host)
     return nil
 end
 
+function Substack:personById(id)
+    id = tonumber(id)
+    for _i, p in ipairs(self.people) do
+        if tonumber(p.id) == id then return p end
+    end
+    return nil
+end
+
+--- Days a sync looks back (0 = no limit).
+function Substack:syncDays()
+    local d = tonumber(self.settings:readSetting("sync_days"))
+    if not d then return SYNC_DAYS_DEFAULT end
+    return d
+end
+
+--- "last 7 days", "last 12 hours", "no limit".
+function Substack:syncWindowLabel(days)
+    days = days or self:syncDays()
+    if days <= 0 then return _("any date") end
+    if days < 1 then return T(_("last %1 hours"), math.floor(days * 24 + 0.5)) end
+    if days == 1 then return _("last 24 hours") end
+    return T(_("last %1 days"), days)
+end
+
+--- Oldest post date (ISO string) a sync will download, or "" for no limit.
+function Substack:syncCutoff()
+    local days = self:syncDays()
+    if days <= 0 then return "" end
+    return isoDaysAgo(days)
+end
+
 local SORT_LABELS = {
     newest = _("Newest first"), oldest = _("Oldest first"),
     shortest = _("Shortest first"), publication = _("By publication"),
@@ -274,12 +319,14 @@ end
 --- Hands the list preferences (sort order, short-read length, muted
 -- publications) to the library, so every list agrees.
 function Substack:applyLibraryPrefs()
-    local muted = {}
+    local muted, handles = {}, {}
     for _i, p in ipairs(self.publications) do
         if p.muted then muted[p.host] = true end
+        if p.handle then handles[p.host] = p.handle end
     end
     self.library:setPrefs{
         muted = muted,
+        handles = handles, -- for articles saved before handles were recorded
         sort = self.settings:readSetting("inbox_sort") or "newest",
         short_words = (self.settings:readSetting("short_minutes") or 5) * 230,
     }
@@ -392,6 +439,11 @@ function Substack:originLabel(o)
     o = o or Return.to
     if not o then return nil end
     if o.kind == "archive" then return o.name or SH.displayName(o.host) end
+    if o.kind == "library" and o.group_label then return o.group_label end
+    if o.kind == "person" then
+        local p = self:personById(o.id)
+        return p and SH.whoLabel(p.name, p.handle) or _("People you follow")
+    end
     if o.kind == "library" then
         return ({ inbox = _("Inbox"), short = _("Short reads"), archive = _("Archive"),
                   kept = _("Kept & highlighted"), all = _("All saved articles") })[o.list] or _("Inbox")
@@ -423,6 +475,14 @@ function Substack:reopenOrigin(o)
             self:showArchive(self:pubByHost(o.host) or { host = o.host, name = o.name or SH.displayName(o.host) })
         elseif o.kind == "library" then
             self:showLibraryList(o.list or "inbox")
+            if o.group then
+                -- The writer's list on top of the grouped Inbox, so Back goes there.
+                self:showLibraryList(o.list or "inbox", { key = o.group, label = o.group_label or "?" })
+            end
+        elseif o.kind == "person" then
+            local p = self:personById(o.id)
+            self:showPeople()
+            if p then self:showPerson(p) end
         elseif o.kind == "latest" then
             self:showLatest()
         elseif o.kind == "saved" then
@@ -759,6 +819,8 @@ function Substack:saveArticle(host, pub_name, post)
     end
 
     local paid = isPaid(post)
+    local followed = self:pubByHost(host)
+    local handle = SH.postHandle(post) or (followed and followed.handle) or nil
     local meta = {
         title = str(post.title) or str(post.slug) or "Untitled",
         subtitle = str(post.subtitle),
@@ -782,6 +844,7 @@ function Substack:saveArticle(host, pub_name, post)
         path = path, title = meta.title, subtitle = meta.subtitle, author = meta.author,
         publication = pub_name, host = host, slug = str(post.slug), id = post.id,
         date = meta.date, url = meta.url, words = meta.words, paid = paid or nil,
+        handle = handle,
     }
     -- A re-download whose title changed lands in a new file: drop the old copy.
     self.library:removeOlderCopies(path)
@@ -898,9 +961,18 @@ function Substack:cachePosts(host, posts, no_flush)
     self.cache:saveSetting(host, c)
     if not no_flush then self.cache:flush() end
     local pub = self:pubByHost(host)
+    local changed = false
     if pub and not pub.id and posts[1] and posts[1].publication_id then
         pub.id = posts[1].publication_id
-        self:saveSettings()
+        changed = true
+    end
+    -- Remember who writes it, for labels like "The Cute Club (@amymatt)".
+    if pub and not pub.handle then
+        local h = SH.mainHandle(posts)
+        if h then pub.handle = h changed = true end
+    end
+    if changed then
+        if no_flush then self.settings:saveSetting("publications", self.publications) else self:saveSettings() end
     end
     return c
 end
@@ -939,13 +1011,30 @@ function Substack:sync(opts)
         -- Phase 1: check every publication and collect its newest posts
         -- (up to per_pub each). Nothing is downloaded yet.
         local skip_podcasts = (self.settings:readSetting("podcasts") or "skip") == "skip"
-        local pool = {}
+        local pool, in_pool = {}, {}
+        local function addToPool(pub, post)
+            local key = pub.host .. "|" .. tostring(post.slug)
+            if in_pool[key] then return false end
+            in_pool[key] = true
+            pool[#pool + 1] = { pub = pub, post = post }
+            return true
+        end
+        -- Only posts from the sync window (Settings → Download posts from the
+        -- last…) are fetched; older ones stay browsable but never take up space.
+        local cutoff = self:syncCutoff()
         for i, pub in ipairs(self.publications) do
-            if not step(T(_("Checking %1 (%2 / %3)…"), pub.name, i, #self.publications)) then break end
+            if not step(T(_("Checking %1 (%2 / %3)…"), pubLabel(pub), i, #self.publications)) then break end
             local posts, err = self.net:archive(pub.host, 0, math.max(per_pub, 12))
             if posts then
                 self:cachePosts(pub.host, posts, true) -- written once, after the loop
-                local since = pub.last_seen or isoDaysAgo(14)
+                -- Added by address, so only the subdomain is known: look up the real name once.
+                if not pub.name_checked and pub.name == SH.displayName(pub.host) then
+                    pub.name_checked = true
+                    local real = self.net:publicationName(pub.host)
+                    if real then pub.name = real end
+                end
+                local since = pub.last_seen or ""
+                if cutoff > since then since = cutoff end
                 local newest = pub.last_seen
                 local candidates = {}
                 for _i, p in ipairs(posts) do
@@ -957,7 +1046,7 @@ function Substack:sync(opts)
                 if pub.auto ~= false and not pub.muted then
                     for j = 1, math.min(per_pub, #candidates) do
                         if not self:isSaved(pub.name, candidates[j]) then
-                            pool[#pool + 1] = { pub = pub, post = candidates[j] }
+                            addToPool(pub, candidates[j])
                         end
                     end
                 end
@@ -967,6 +1056,50 @@ function Substack:sync(opts)
                 logger.warn("Substack: sync failed for", pub.host, err)
             end
             if cancelled then break end
+        end
+
+        -- People you follow who have no publication of their own: their newest
+        -- posts, wherever they were published.
+        if not cancelled and #self.people > 0 then
+            for i, person in ipairs(self.people) do
+                local who = SH.whoLabel(person.name, person.handle)
+                if not step(T(_("Checking %1 (%2 / %3)…"), who, i, #self.people)) then break end
+                if not person.muted and person.auto ~= false then
+                    local feed, err = self.net:profileFeed(person.id)
+                    if feed then
+                        if feed.person then
+                            person.name = feed.person.name or person.name
+                            person.handle = feed.person.handle or person.handle
+                        end
+                        local since = person.last_seen or ""
+                        if cutoff > since then since = cutoff end
+                        local newest, n = person.last_seen, 0
+                        for _j, e in ipairs(feed.posts) do
+                            local d = str(e.post.post_date) or ""
+                            if not newest or d > newest then newest = d end
+                            local is_podcast = e.post.type == "podcast"
+                            if n < per_pub and d > since and not (skip_podcasts and is_podcast) then
+                                local followed = self:pubByHost(e.host)
+                                local pub = {
+                                    host = e.host,
+                                    name = followed and followed.name or e.pub_name or SH.displayName(e.host),
+                                    handle = person.handle,
+                                }
+                                if not (followed and followed.muted) and not self:isSaved(pub.name, e.post)
+                                        and addToPool(pub, e.post) then
+                                    n = n + 1
+                                end
+                            end
+                        end
+                        person.last_seen = newest
+                    else
+                        failed[#failed + 1] = who
+                        if tostring(err):find("HTTP 40[13]") then session_expired = true end
+                        logger.warn("Substack: sync failed for person", person.id, err)
+                    end
+                end
+                if cancelled then break end
+            end
         end
         self.cache:flush()
         self:saveSettings()
@@ -985,7 +1118,7 @@ function Substack:sync(opts)
                 break
             end
             local e = pool[j]
-            if not step(T(_("Downloading %1 / %2 from %3:\n%4"), j, math.min(max_new, #pool), e.pub.name, str(e.post.title) or "")) then break end
+            if not step(T(_("Downloading %1 / %2 from %3:\n%4"), j, math.min(max_new, #pool), pubLabel(e.pub), str(e.post.title) or "")) then break end
             if self:downloadPost(e.pub.host, e.pub.name, e.post) then saved_count = saved_count + 1 end
         end
 
@@ -1050,7 +1183,7 @@ function Substack:sync(opts)
             msg = msg .. "\n" .. _("Your weekly digest is ready (Library → Digests).")
         end
         if session_expired then
-            msg = msg .. "\n\n" .. _("Your Substack sign-in has expired, so posts saved in the Substack app were skipped. Sign in again under Account.")
+            msg = msg .. "\n\n" .. _("Your Substack sign-in has expired, so posts from people you follow and posts saved in the Substack app were skipped. Sign in again under Account.")
         end
         if opts.auto and saved_count == 0 and #failed == 0 then
             showMsg(msg, 2)
@@ -1149,7 +1282,7 @@ function Substack:postItem(entry)
     if isPaid(post) then prefix = "[paid] " end
     if post.type == "podcast" then prefix = prefix .. "[audio] " end
     local text = prefix .. (str(post.title) or str(post.slug) or "?")
-    if entry.show_pub then text = text .. "  — " .. pub.name end
+    if entry.show_pub then text = text .. "  — " .. SH.whoLabel(pub.name, pub.handle or SH.postHandle(post)) end
     local saved = self:isSaved(pub.name, post)
     local rt = SH.readingTime(post.wordcount)
     local mandatory = (saved and "✓ " or "") .. (postDate(post) or "")
@@ -1389,8 +1522,10 @@ end
 -- Library views (Inbox / Archive / Kept / All)
 ---------------------------------------------------------------------------
 
-function Substack:libraryItem(e, kind)
+--- nested = true: shown indented under its writer's heading in the grouped Inbox.
+function Substack:libraryItem(e, kind, group, nested)
     local a = e.meta
+    local origin = { kind = "library", list = kind, group = group and group.key, group_label = group and group.label }
     local rt = SH.readingTime(a.words)
     local state
     if e.status == "reading" then
@@ -1402,11 +1537,14 @@ function Substack:libraryItem(e, kind)
     end
     if a.kept then state = "★ " .. state end
     return {
-        text = (a.title or "?") .. (a.publication and ("  — " .. a.publication) or ""),
+        -- Inside one writer's list the name is in the title already.
+        text = (nested and "      " or "") .. (a.title or "?")
+            .. ((not group and not nested and (a.publication or a.handle))
+                and ("  — " .. SH.whoLabel(a.publication, self.library:handleOf(a))) or ""),
         mandatory = state .. (rt and (" · " .. rt) or ""),
-        action = function() self:openFile(e.path, { kind = "library", list = kind }) end,
+        action = function() self:openFile(e.path, origin) end,
         hold_action = function()
-            local rows = { { { _("Read"), function() self:openFile(e.path, { kind = "library", list = kind }) end } } }
+            local rows = { { { _("Read"), function() self:openFile(e.path, origin) end } } }
             if e.status == "finished" then
                 table.insert(rows, { { _("Mark as unread"), function()
                     self.library:setOverride(e.path, "unread")
@@ -1470,19 +1608,27 @@ local LIST_TITLES = {
     short = _("Short reads"),
 }
 
-function Substack:showLibraryList(kind)
+--- kind: "inbox" | "short" | "archive" | "kept" | "all".
+-- group (optional): { key, label } to show only one writer's articles.
+function Substack:showLibraryList(kind, group)
     self:scanLibrary()
     local function title()
+        if group then
+            return T(_("%1 (%2)"), group.label, #self.library:list(kind, group.key))
+        end
         if kind == "inbox" then return T(_("Inbox (%1 unread)"), self.library:unreadCount()) end
         if kind == "short" then
             return T(_("Short reads (up to %1 min)"), self.settings:readSetting("short_minutes") or 5)
         end
         return LIST_TITLES[kind]
     end
+    local grouped = function()
+        return not group and (kind == "inbox" or kind == "all") and self.settings:nilOrTrue("group_by_writer")
+    end
     self:newMenu(nil, function()
         self:applyLibraryPrefs()
         local items = {}
-        if kind == "inbox" or kind == "short" then
+        if (kind == "inbox" or kind == "short") and not group then
             -- Sort order (shared by Inbox and Short reads).
             items[#items + 1] = {
                 text = T(_("Sort: %1"), SORT_LABELS[self.settings:readSetting("inbox_sort") or "newest"]),
@@ -1501,7 +1647,18 @@ function Substack:showLibraryList(kind)
                 end,
             }
         end
-        if kind == "inbox" then
+        if (kind == "inbox" or kind == "all") and not group then
+            items[#items + 1] = {
+                text = grouped() and _("Grouped by writer (tap for one list)") or _("One list (tap to group by writer)"),
+                keep_open = true,
+                action = function()
+                    self.settings:saveSetting("group_by_writer", not self.settings:nilOrTrue("group_by_writer"))
+                    self.settings:flush()
+                    self:refreshMenus()
+                end,
+            }
+        end
+        if kind == "inbox" and not group then
             local short_n = #self.library:list("short")
             if short_n > 0 then
                 items[#items + 1] = {
@@ -1515,29 +1672,87 @@ function Substack:showLibraryList(kind)
                 keep_open = true, -- the Inbox refreshes itself when the sync finishes
                 action = function() self:sync() end,
             }
-            if self.library:unreadCount() > 0 then
+        end
+        if (kind == "inbox" or (group and kind ~= "archive")) and self.library:unreadCount() > 0 then
+            local gkey = group and group.key
+            items[#items + 1] = {
+                text = group and _("Mark all from this writer as finished…") or _("Mark all as finished…"),
+                keep_open = true,
+                action = function()
+                    local todo = {}
+                    for _i, e in ipairs(self.library:list(kind, gkey)) do
+                        if e.status ~= "finished" then todo[#todo + 1] = e end
+                    end
+                    UIManager:show(ConfirmBox:new{
+                        text = T(_("Mark %1 article(s) as finished, including ones you've started? They move to the Archive."), #todo),
+                        ok_text = _("Mark finished"),
+                        ok_callback = function()
+                            for _i, e in ipairs(todo) do
+                                self.library:setOverride(e.path, "finished", true)
+                                self:setKOStatus(e.path, "complete")
+                            end
+                            self:refreshMenus()
+                        end,
+                    })
+                end,
+            }
+        end
+        local count
+        if grouped() then
+            -- Each writer is a heading with their articles listed underneath.
+            -- Tap a heading to fold it away (▸) or open it again (▾).
+            local groups = self.library:groups(kind)
+            count = #groups
+            local collapsed = self.settings:readSetting("collapsed_writers") or {}
+            local any_open = false
+            for _i, g in ipairs(groups) do if not collapsed[g.key] then any_open = true end end
+            if #groups > 1 then
                 items[#items + 1] = {
-                    text = _("Mark all as finished…"),
+                    text = any_open and _("▴ Collapse all writers") or _("▾ Expand all writers"),
                     keep_open = true,
                     action = function()
-                        UIManager:show(ConfirmBox:new{
-                            text = T(_("Mark all %1 article(s) in your Inbox as finished, including ones you've started? They move to the Archive."), #self.library:list("inbox")),
-                            ok_text = _("Mark finished"),
-                            ok_callback = function()
-                                for _i, e in ipairs(self.library:list("inbox")) do
-                                    self.library:setOverride(e.path, "finished", true)
-                                    self:setKOStatus(e.path, "complete")
-                                end
-                                self:refreshMenus()
-                            end,
-                        })
+                        local c = {}
+                        if any_open then for _i, g in ipairs(groups) do c[g.key] = true end end
+                        self.settings:saveSetting("collapsed_writers", c)
+                        self.settings:flush()
+                        self:refreshMenus()
                     end,
                 }
             end
+            for _i, g in ipairs(groups) do
+                local label = SH.whoLabel(g.meta.publication, g.handle)
+                local parts = {}
+                if g.reading > 0 then parts[#parts + 1] = T(_("%1 reading"), g.reading) end
+                if g.unread > 0 then parts[#parts + 1] = T(_("%1 new"), g.unread) end
+                if #parts == 0 then parts[1] = tostring(g.count) end
+                local folded = collapsed[g.key]
+                items[#items + 1] = {
+                    text = (folded and "▸ " or "▾ ") .. label,
+                    mandatory = table.concat(parts, " · "),
+                    bold = true,
+                    keep_open = true,
+                    action = function()
+                        local c = self.settings:readSetting("collapsed_writers") or {}
+                        c[g.key] = (not c[g.key]) or nil
+                        self.settings:saveSetting("collapsed_writers", c)
+                        self.settings:flush()
+                        self:refreshMenus()
+                    end,
+                    -- Long-press: just this writer, full screen.
+                    hold_action = function() self:showLibraryList(kind, { key = g.key, label = label }) end,
+                }
+                if not folded then
+                    for _j, e in ipairs(g.entries) do
+                        items[#items + 1] = self:libraryItem(e, kind, nil, true)
+                    end
+                end
+            end
+        else
+            local list = self.library:list(kind, group and group.key)
+            count = #list
+            for _i, e in ipairs(list) do items[#items + 1] = self:libraryItem(e, kind, group) end
         end
-        local list = self.library:list(kind)
-        for _i, e in ipairs(list) do items[#items + 1] = self:libraryItem(e, kind) end
-        if #list == 0 then
+        if count == 0 then
             local empty = {
                 inbox = _("Nothing to read. Sync, or open a publication and save some posts."),
                 archive = _("Finished articles appear here."),
@@ -1545,7 +1760,7 @@ function Substack:showLibraryList(kind)
                 all = _("No saved articles yet."),
                 short = _("No short articles in your Inbox right now."),
             }
-            items[#items + 1] = { text = empty[kind] }
+            items[#items + 1] = { text = group and _("Nothing left from this writer.") or empty[kind] }
         end
         return items
     end, title)
@@ -1729,11 +1944,13 @@ local DEFAULT_RESET_KEYS = {
     "auto_sync", "weekly_digest", "per_pub", "image_quality", "comments", "podcasts",
     "end_prompt", "hide_from_history", "cleanup_days", "short_minutes", "inbox_sort",
     "weekly_goal", "sync_saved", "max_per_sync", "wifi_off_after_sync", "return_to_bookshelf",
+    "sync_days", "group_by_writer", "collapsed_writers",
 }
 
 local BACKUP_SETTINGS = {
     "auto_sync", "per_pub", "image_quality", "comments", "end_prompt", "hide_from_history",
     "cleanup_days", "sync_saved", "weekly_digest", "short_minutes", "inbox_sort", "weekly_goal", "podcasts", "max_per_sync", "wifi_off_after_sync", "return_to_bookshelf",
+    "sync_days", "group_by_writer",
 }
 
 --- Saves publications (OPML, readable by any feed reader) and settings
@@ -1742,14 +1959,19 @@ function Substack:backup()
     local dir = self:exportsDir()
     local pubs = {}
     for _i, p in ipairs(self.publications) do
-        pubs[#pubs + 1] = { host = p.host, name = p.name, id = p.id, auto = p.auto, muted = p.muted }
+        pubs[#pubs + 1] = { host = p.host, name = p.name, id = p.id, auto = p.auto, muted = p.muted,
+                            handle = p.handle, author = p.author }
+    end
+    local people = {}
+    for _i, p in ipairs(self.people) do
+        people[#people + 1] = { id = p.id, name = p.name, handle = p.handle, auto = p.auto, muted = p.muted }
     end
     local settings = {}
     for _i, k in ipairs(BACKUP_SETTINGS) do settings[k] = self.settings:readSetting(k) end
     local ok1 = writeFile(dir .. "/substack-publications.opml", Export.opml(pubs))
     local ok2 = writeFile(dir .. "/substack-backup.lua",
         "-- Substack for KOReader backup (" .. os.date("%Y-%m-%d %H:%M") .. "). No sign-in details.\n"
-        .. Export.serialize({ version = VERSION, publications = pubs, settings = settings }) .. "\n")
+        .. Export.serialize({ version = VERSION, publications = pubs, people = people, settings = settings }) .. "\n")
     if not (ok1 and ok2) then showMsg(_("Could not write the backup files.")) return end
     showMsg(T(_("Backed up %1 publication(s) and your settings to:\n\n%2\n\n• substack-backup.lua: everything, for this plugin\n• substack-publications.opml: your publications, for any feed reader\n\nYour sign-in is not included."),
         #pubs, dir))
@@ -1763,7 +1985,10 @@ function Substack:restoreFrom(path)
     local function addPub(host, name, extra)
         if not host or self:pubByHost(host) then return end
         local p = { host = host, name = name or SH.displayName(host) }
-        if extra then p.id, p.auto, p.muted = extra.id, extra.auto, extra.muted end
+        if extra then
+            p.id, p.auto, p.muted = extra.id, extra.auto, extra.muted
+            p.handle, p.author = extra.handle, extra.author
+        end
         table.insert(self.publications, p)
         added = added + 1
     end
@@ -1778,6 +2003,11 @@ function Substack:restoreFrom(path)
         if not data then showMsg(T(_("That isn't a backup file from this plugin (%1)."), tostring(err))) return end
         for _i, p in ipairs(type(data.publications) == "table" and data.publications or {}) do
             if type(p) == "table" and type(p.host) == "string" then addPub(SH.normalizeHost(p.host), p.name, p) end
+        end
+        for _i, p in ipairs(type(data.people) == "table" and data.people or {}) do
+            if type(p) == "table" and tonumber(p.id) and not self:personById(p.id) then
+                table.insert(self.people, { id = tonumber(p.id), name = p.name, handle = p.handle, auto = p.auto, muted = p.muted })
+            end
         end
         if type(data.settings) == "table" then
             for _i, k in ipairs(BACKUP_SETTINGS) do
@@ -1919,19 +2149,27 @@ function Substack:showPublications()
             self:addPublicationDialog(function() if menu then menu:switchItemTable(nil, build()) end end)
         end } }
         if self:isLoggedIn() then
-            items[#items + 1] = { text = _("+ Import my Substack subscriptions"), keep_open = true, action = function() self:importSubscriptions() end }
+            items[#items + 1] = { text = _("+ Import my subscriptions & the people I follow"), keep_open = true, action = function() self:importSubscriptions() end }
+        end
+        if #self.people > 0 then
+            items[#items + 1] = {
+                text = T(_("People you follow (%1) ›"), #self.people),
+                mandatory = _("no publication"),
+                keep_open = true,
+                action = function() self:showPeople() end,
+            }
         end
         for i, pub in ipairs(self.publications) do
             local c = self:cached(pub.host)
             local latest = c and c.posts and c.posts[1] and postDate(c.posts[1])
             items[#items + 1] = {
-                text = pub.name .. (pub.muted and _("  (muted)") or (pub.auto == false and _("  (no auto-download)") or "")),
+                text = pubLabel(pub) .. (pub.muted and _("  (muted)") or (pub.auto == false and _("  (no auto-download)") or "")),
                 mandatory = latest or "",
                 -- Keep the publication list underneath, so Back returns to it.
                 keep_open = true,
                 action = function() self:showArchive(pub) end,
                 hold_action = function()
-                    buttonDialog(pub.name .. "\n" .. pub.host, {
+                    buttonDialog(pubLabel(pub) .. "\n" .. pub.host, {
                         { { pub.muted and _("Unmute") or _("Mute (hide from Inbox, no downloads)"), function()
                             -- Muted: still browsable here, but nothing lands in the Inbox.
                             pub.muted = (not pub.muted) or nil
@@ -1969,6 +2207,68 @@ function Substack:showPublications()
     end
     menu = self:newMenu(T(_("Publications (%1)"), #self.publications), build)
     menu.rebuild_title = function() return T(_("Publications (%1)"), #self.publications) end
+end
+
+--- People you follow who have no publication of their own.
+function Substack:showPeople()
+    local menu
+    local function build()
+        local items = {}
+        for i, person in ipairs(self.people) do
+            local who = SH.whoLabel(person.name, person.handle)
+            items[#items + 1] = {
+                text = who .. (person.muted and _("  (muted)") or (person.auto == false and _("  (no auto-download)") or "")),
+                keep_open = true,
+                action = function() self:showPerson(person) end,
+                hold_action = function()
+                    buttonDialog(who, {
+                        { { person.muted and _("Unmute") or _("Mute (no downloads)"), function()
+                            person.muted = (not person.muted) or nil
+                            self:saveSettings()
+                            menu:switchItemTable(nil, build(), -1)
+                        end } },
+                        { { _("Unfollow (on this device)"), function()
+                            UIManager:show(ConfirmBox:new{
+                                text = T(_("Stop syncing %1 here? Saved articles stay. (This doesn't unfollow them on Substack.)"), who),
+                                ok_text = _("Unfollow"),
+                                ok_callback = function()
+                                    table.remove(self.people, i)
+                                    self:saveSettings()
+                                    menu:switchItemTable(nil, build(), -1)
+                                end,
+                            })
+                        end } },
+                    })
+                end,
+            }
+        end
+        if #self.people == 0 then items[#items + 1] = { text = _("Nobody here. Import the people you follow from Publications.") } end
+        return items
+    end
+    menu = self:newMenu(T(_("People you follow (%1)"), #self.people), build)
+end
+
+--- A person's recent posts (from their Substack profile).
+function Substack:showPerson(person)
+    local who = SH.whoLabel(person.name, person.handle)
+    self:online(function()
+        Trapper:info(T(_("Loading %1…"), who))
+        local feed, err = self.net:profileFeed(person.id)
+        Trapper:clear()
+        if not feed then
+            showMsg(T(_("Could not load %1:\n%2"), who, Net.friendly(err)))
+            return
+        end
+        local entries = {}
+        for _i, e in ipairs(feed.posts) do
+            local followed = self:pubByHost(e.host)
+            entries[#entries + 1] = {
+                post = e.post, show_pub = true,
+                pub = { host = e.host, name = followed and followed.name or e.pub_name or SH.displayName(e.host), handle = person.handle },
+            }
+        end
+        self:showPostList({ title = who, entries = entries, origin = { kind = "person", id = person.id } })
+    end)
 end
 
 --- Shows a list of publications (search results, recommendations).
@@ -2078,7 +2378,7 @@ function Substack:login(email, password)
             self.settings:saveSetting("email", email)
             self.settings:flush()
             UIManager:show(ConfirmBox:new{
-                text = _("Signed in.\n\nImport the publications you subscribe to?"),
+                text = _("Signed in.\n\nImport the publications you subscribe to and the people you follow?"),
                 ok_text = _("Import"),
                 ok_callback = function() self:importSubscriptions() end,
             })
@@ -2128,7 +2428,7 @@ function Substack:signedIn(sid, email)
     self.settings:saveSetting("email", email)
     self.settings:flush()
     UIManager:show(ConfirmBox:new{
-        text = _("Signed in.\n\nImport the publications you subscribe to?"),
+        text = _("Signed in.\n\nImport the publications you subscribe to and the people you follow?"),
         ok_text = _("Import"),
         ok_callback = function() self:importSubscriptions() end,
     })
@@ -2221,35 +2521,117 @@ function Substack:enterCodeDialog(state)
     dialog:onShowKeyboard()
 end
 
+--- Adds one publication found while importing (or fills in who writes it).
+-- Returns true if it was new.
+function Substack:addImportedPub(p, extra)
+    local existing = self:pubByHost(p.host)
+    if existing then
+        existing.handle = existing.handle or p.handle or (extra and extra.handle)
+        existing.author = existing.author or p.author or (extra and extra.author)
+        return false
+    end
+    table.insert(self.publications, {
+        host = p.host, name = p.name or SH.displayName(p.host), id = p.id,
+        handle = p.handle or (extra and extra.handle), author = p.author or (extra and extra.author),
+        via = extra and extra.via or nil,
+    })
+    return true
+end
+
+--- Imports both kinds of "following" on Substack, which are separate there:
+-- 1. publications you subscribe to (/subscriptions), and
+-- 2. people you follow (/feed/following). For each person, their own
+--    publication is added; people without one are followed directly and
+--    their posts arrive with each sync.
+-- Must run inside Trapper. Returns a summary table, or nil, err.
+function Substack:doImport()
+    local r = { pubs = 0, people_pubs = 0, people = 0, people_total = 0, missed = 0 }
+    Trapper:info(_("Fetching the publications you subscribe to…"))
+    local pubs, err = self.net:subscriptions()
+    if not pubs then return nil, err end
+    r.subscribed = #pubs
+    for _i, p in ipairs(pubs) do
+        if self:addImportedPub(p) then r.pubs = r.pubs + 1 end
+    end
+    self:saveSettings()
+
+    if not Trapper:info(_("Fetching the people you follow…")) then return r end
+    local ids, ferr = self.net:followingIds()
+    if not ids then
+        r.people_error = ferr
+        return r
+    end
+    r.people_total = #ids
+    for i, uid in ipairs(ids) do
+        if not Trapper:info(T(_("Looking up the people you follow… %1 / %2\n\nTap to stop."), i, #ids)) then
+            r.stopped = true
+            break
+        end
+        local person = self.net:person(uid)
+        if not person then
+            r.missed = r.missed + 1
+        elseif #person.publications > 0 then
+            for _j, pub in ipairs(person.publications) do
+                if self:addImportedPub(pub, { handle = person.handle, author = person.name, via = "following" }) then
+                    r.people_pubs = r.people_pubs + 1
+                end
+            end
+            -- Their own publication covers them now.
+            for k = #self.people, 1, -1 do
+                if tonumber(self.people[k].id) == tonumber(uid) then table.remove(self.people, k) end
+            end
+        else
+            local known = self:personById(uid)
+            if known then
+                known.name = person.name or known.name
+                known.handle = person.handle or known.handle
+            else
+                table.insert(self.people, { id = tonumber(uid), name = person.name, handle = person.handle })
+                r.people = r.people + 1
+            end
+        end
+        if i % 10 == 0 then self:saveSettings() end
+    end
+    table.sort(self.people, function(a, b)
+        return SH.whoLabel(a.name, a.handle):lower() < SH.whoLabel(b.name, b.handle):lower()
+    end)
+    return r
+end
+
 function Substack:importSubscriptions()
     if not self:isLoggedIn() then showMsg(_("Sign in first.")) return end
     self:online(function()
-        Trapper:info(_("Fetching your subscriptions…"))
-        local pubs, err = self.net:subscriptions()
+        local r, err = self:doImport()
         Trapper:clear()
-        if not pubs then
+        if not r then
             showMsg(T(_("Could not fetch subscriptions:\n%1"), Net.friendly(err)))
             return
         end
-        local added = 0
-        for _i, p in ipairs(pubs) do
-            if not self:pubByHost(p.host) then
-                table.insert(self.publications, { host = p.host, name = p.name, id = p.id })
-                added = added + 1
-            end
-        end
         table.sort(self.publications, function(a, b) return a.name:lower() < b.name:lower() end)
         self:saveSettings()
+        self:applyLibraryPrefs()
         self:refreshMenus()
-        if #pubs == 0 then
-            showMsg(_("No subscriptions found on this account."))
+        local lines = {
+            T(_("Publications you subscribe to: %1 new."), r.pubs),
+        }
+        if r.people_error then
+            lines[#lines + 1] = T(_("Couldn't fetch the people you follow:\n%1"), Net.friendly(r.people_error))
         else
-            UIManager:show(ConfirmBox:new{
-                text = T(_("Imported %1 new publication(s). You now follow %2.\n\nSync now to fetch their latest posts?"), added, #self.publications),
-                ok_text = _("Sync now"),
-                ok_callback = function() self:sync() end,
-            })
+            lines[#lines + 1] = T(_("People you follow: %1."), r.people_total)
+            lines[#lines + 1] = T(_("• %1 new publication(s) written by them"), r.people_pubs)
+            lines[#lines + 1] = T(_("• %1 writer(s) without a publication of their own, followed directly"), r.people)
+            if r.missed > 0 then lines[#lines + 1] = T(_("• %1 couldn't be looked up"), r.missed) end
+            if r.stopped then lines[#lines + 1] = _("(Stopped early. Import again to finish.)") end
         end
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = T(_("You now follow %1 publication(s) and %2 writer(s)."), #self.publications, #self.people)
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = T(_("Sync now? (Downloads posts from: %1)"), self:syncWindowLabel())
+        UIManager:show(ConfirmBox:new{
+            text = table.concat(lines, "\n"),
+            ok_text = _("Sync now"),
+            ok_callback = function() self:sync() end,
+        })
     end)
 end
 
@@ -2257,7 +2639,7 @@ function Substack:cookieDialog()
     local dialog
     dialog = InputDialog:new{
         title = _("Substack session cookie"),
-        description = _("Alternative to signing in. On a computer, sign in to substack.com, open the browser's developer tools → Storage/Application → Cookies, and copy the value of “substack.sid”. Leave empty to remove."),
+        description = _("Alternative to signing in. On a computer, sign in to substack.com, open the browser's developer tools → Storage/Application → Cookies, and copy the value of “connect.sid” (older accounts: “substack.sid”). Leave empty to remove."),
         input = self.settings:readSetting("cookie") or "",
         buttons = {{
             { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
@@ -2311,11 +2693,11 @@ function Substack:readCookieFile(path)
     end
     content = table.concat(kept, "")
     if content:find("PASTE_YOUR_SUBSTACK_SID") then
-        return nil, _("The cookie file still has the placeholder text. Replace PASTE_YOUR_SUBSTACK_SID_VALUE_HERE with your substack.sid value.")
+        return nil, _("The cookie file still has the placeholder text. Replace PASTE_YOUR_SUBSTACK_SID_VALUE_HERE with your connect.sid (or substack.sid) value.")
     end
     local cookie = Net.cleanCookie(SH.trim(content))
     if not cookie then
-        return nil, _("That file doesn't contain a substack.sid value. Put only the value (or substack.sid=value) in it.")
+        return nil, _("That file doesn't contain a session value. Put only the connect.sid (or substack.sid) value in it, or connect.sid=value.")
     end
     return cookie
 end
@@ -2349,14 +2731,14 @@ function Substack:cookieAccepted(path)
         ok_callback = function()
             os.remove(path)
             UIManager:show(ConfirmBox:new{
-                text = _("File deleted.\n\nImport the publications you subscribe to?"),
+                text = _("File deleted.\n\nImport the publications you subscribe to and the people you follow?"),
                 ok_text = _("Import"),
                 ok_callback = function() self:importSubscriptions() end,
             })
         end,
         cancel_callback = function()
             UIManager:show(ConfirmBox:new{
-                text = _("Import the publications you subscribe to?"),
+                text = _("Import the publications you subscribe to and the people you follow?"),
                 ok_text = _("Import"),
                 ok_callback = function() self:importSubscriptions() end,
             })
@@ -2403,7 +2785,7 @@ function Substack:accountMenu()
                 end
             end)
         end })
-        table.insert(items, { text = _("Import my subscriptions"), callback = function() self:importSubscriptions() end })
+        table.insert(items, { text = _("Import my subscriptions & the people I follow"), callback = function() self:importSubscriptions() end })
         table.insert(items, {
             text = _("Include posts I save in the Substack app when syncing"),
             checked_func = function() return self.settings:nilOrTrue("sync_saved") end,
@@ -2453,6 +2835,61 @@ local function radio(self, key, default, options)
     return items
 end
 
+local SYNC_WINDOWS = { 0.5, 1, 3, 7, 14, 30, 90, 0 }
+
+function Substack:syncWindowMenu()
+    local items = {}
+    local preset = {}
+    for _i, d in ipairs(SYNC_WINDOWS) do
+        preset[d] = true
+        items[#items + 1] = {
+            text = d == 0 and _("Any date (no limit)") or (self:syncWindowLabel(d):gsub("^%l", string.upper)),
+            radio = true,
+            checked_func = function() return self:syncDays() == d end,
+            callback = function()
+                self.settings:saveSetting("sync_days", d)
+                self.settings:flush()
+            end,
+        }
+    end
+    items[#items + 1] = {
+        text_func = function()
+            local d = self:syncDays()
+            if not preset[d] then return T(_("Custom: %1"), self:syncWindowLabel(d)) end
+            return _("Custom…")
+        end,
+        radio = true,
+        checked_func = function() return not preset[self:syncDays()] end,
+        keep_menu_open = true,
+        callback = function(touchmenu)
+            local dialog
+            dialog = InputDialog:new{
+                title = _("Download posts from the last…"),
+                description = _("Number of days (e.g. 2, 10, 60). Use 0.25 for 6 hours, 0 for any date."),
+                input = tostring(self:syncDays()),
+                input_type = "number",
+                buttons = {{
+                    { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+                    { text = _("Save"), is_enter_default = true, callback = function()
+                        local d = tonumber((dialog:getInputText() or ""):gsub(",", "."))
+                        if not d or d < 0 or d > 3650 then
+                            showMsg(_("Enter a number of days between 0 and 3650."))
+                            return
+                        end
+                        self.settings:saveSetting("sync_days", d)
+                        self.settings:flush()
+                        UIManager:close(dialog)
+                        if touchmenu then touchmenu:updateItems() end
+                    end },
+                }},
+            }
+            UIManager:show(dialog)
+            dialog:onShowKeyboard()
+        end,
+    }
+    return items
+end
+
 function Substack:settingsMenu()
     return {
         {
@@ -2490,6 +2927,11 @@ function Substack:settingsMenu()
         {
             text_func = function() return T(_("New posts per publication per sync: %1"), self.settings:readSetting("per_pub") or 3) end,
             sub_item_table = radio(self, "per_pub", 3, { { 1, "1" }, { 3, "3" }, { 5, "5" }, { 10, "10" } }),
+        },
+        {
+            text_func = function() return T(_("Download posts from: %1"), self:syncWindowLabel()) end,
+            help_text = _("Sync only downloads posts published within this window, from publications and people you follow. Older posts stay browsable under Publications but don't take up space. Posts you bookmark in the Substack app always come through."),
+            sub_item_table_func = function() return self:syncWindowMenu() end,
         },
         {
             text = _("Images"),
@@ -2646,7 +3088,8 @@ function Substack:about()
     showMsg(table.concat({
         T(_("Substack for KOReader %1"), VERSION),
         "",
-        T(_("Following: %1 publications"), #self.publications),
+        T(_("Following: %1 publications, %2 writers"), #self.publications, #self.people),
+        T(_("Downloads posts from: %1"), self:syncWindowLabel()),
         T(_("Saved: %1 articles (%2)"), count, humanSize(bytes)),
         T(_("Unread: %1"), self.library:unreadCount()),
         T(_("Last sync: %1"), ago(self.settings:readSetting("last_sync"))),
